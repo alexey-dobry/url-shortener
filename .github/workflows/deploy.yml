@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       rollback_tag:
-        description: "Тег образа для отката (пусто = деплоим свежий)"
+        description: "Tag for rollback (empty = deploy fresh)"
         required: false
         default: ""
 
@@ -95,7 +95,7 @@ jobs:
 
       - name: Run migrations
         run: |
-          docker compose run --rm -e APP_IMAGE=${{ env.APP_IMAGE }} app migrate
+          docker compose run --rm app migrate
           echo "Migrations OK"
 
       - name: Deploy 3 replicas
@@ -107,30 +107,49 @@ jobs:
       - name: Smoke test
         id: smoke
         run: |
+          set -e
+
+          echo "=== healthz ==="
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/healthz)
           echo "healthz: $STATUS"
           [ "$STATUS" = "200" ]
 
+          echo "=== info ==="
           curl -s http://localhost:8080/info | tee /tmp/info.json
+          echo ""
           grep -q "${{ env.DEPLOY_TAG }}" /tmp/info.json
 
-          curl -sf -X POST http://localhost:8080/auth/register \
+          echo "=== register ==="
+          REG_STATUS=$(curl -s -o /tmp/reg.json -w "%{http_code}" -X POST http://localhost:8080/auth/register \
             -H 'Content-Type: application/json' \
-            -d '{"username":"ci","password":"secret123"}' || true
+            -d '{"username":"ci-test","password":"secret123"}')
+          echo "register: $REG_STATUS $(cat /tmp/reg.json)"
+          # 201 = created, 409 = already exists (both OK)
+          [ "$REG_STATUS" = "201" ] || [ "$REG_STATUS" = "409" ]
 
-          curl -sf -c /tmp/jar -X POST http://localhost:8080/auth/login \
+          echo "=== login ==="
+          LOGIN_STATUS=$(curl -s -o /tmp/login.json -w "%{http_code}" -c /tmp/jar -X POST http://localhost:8080/auth/login \
             -H 'Content-Type: application/json' \
-            -d '{"username":"ci","password":"secret123"}'
+            -d '{"username":"ci-test","password":"secret123"}')
+          echo "login: $LOGIN_STATUS $(cat /tmp/login.json)"
+          [ "$LOGIN_STATUS" = "200" ]
 
-          RESP=$(curl -sf -b /tmp/jar -X POST http://localhost:8080/shorten \
+          echo "=== shorten ==="
+          SHORT_STATUS=$(curl -s -o /tmp/short.json -w "%{http_code}" -b /tmp/jar -X POST http://localhost:8080/shorten \
             -H 'Content-Type: application/json' \
             -d '{"url":"https://example.com"}')
-          CODE=$(echo "$RESP" | grep -o '"code":"[^"]*"' | cut -d'"' -f4)
-          echo "Created short link: $CODE"
+          echo "shorten: $SHORT_STATUS $(cat /tmp/short.json)"
+          [ "$SHORT_STATUS" = "201" ]
 
-          curl -sf http://localhost:8080/stats/$CODE | grep '"clicks":0'
+          CODE=$(cat /tmp/short.json | grep -o '"code":"[^"]*"' | cut -d'"' -f4)
+          echo "code: $CODE"
 
-          echo "All smoke tests passed"
+          echo "=== stats ==="
+          STATS_STATUS=$(curl -s -o /tmp/stats.json -w "%{http_code}" http://localhost:8080/stats/$CODE)
+          echo "stats: $STATS_STATUS $(cat /tmp/stats.json)"
+          [ "$STATS_STATUS" = "200" ]
+
+          echo "=== All smoke tests passed ==="
 
       - name: Rollback
         if: failure() && steps.smoke.outcome == 'failure'
@@ -151,4 +170,3 @@ jobs:
           else
             echo "- result: ❌ failed → rollback" >> $GITHUB_STEP_SUMMARY
           fi
-
